@@ -14,9 +14,11 @@ class ZKillboardR2Z2
     private const SLEEP_ON_SUCCESS_US = 100_000; // 100ms (~10 req/s, well under 20/s limit)
     private const SLEEP_ON_404_S = 6;
     private const SLEEP_ON_429_S = 2;
+    private const MAX_RETRIES = 5;
 
     private Client $client;
     private int $lastSequenceId = 0;
+    private bool $running = true;
 
     public function __construct(
         private ?string $stateFile = null,
@@ -55,6 +57,11 @@ class ZKillboardR2Z2
         return $this->request("/{$sequenceId}.json", allowNotFound: true);
     }
 
+    public function stop(): void
+    {
+        $this->running = false;
+    }
+
     /**
      * Poll for new killmails continuously. Calls $callback for each killmail
      * that passes the filter pipeline (if configured).
@@ -62,11 +69,23 @@ class ZKillboardR2Z2
      * @param callable(array $killmail, int $sequenceId): void $callback
      * @param int|null $startFrom Sequence ID to start from (null = resume from state or current)
      */
-    public function poll(callable $callback, ?int $startFrom = null): never
+    public function poll(callable $callback, ?int $startFrom = null): void
     {
+        if (function_exists('pcntl_signal')) {
+            $handler = function () {
+                $this->running = false;
+            };
+            pcntl_signal(SIGTERM, $handler);
+            pcntl_signal(SIGINT, $handler);
+        }
+
         $sequenceId = $startFrom ?? $this->lastSequenceId ?: $this->getCurrentSequence();
 
-        while (true) {
+        while ($this->running) {
+            if (function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+            }
+
             $killmail = $this->getKillmail($sequenceId);
 
             if ($killmail === null) {
@@ -85,6 +104,8 @@ class ZKillboardR2Z2
             $sequenceId++;
             usleep(self::SLEEP_ON_SUCCESS_US);
         }
+
+        echo "Poller stopped at sequence {$this->lastSequenceId}\n";
     }
 
     /**
@@ -92,36 +113,46 @@ class ZKillboardR2Z2
      */
     private function request(string $path, bool $allowNotFound = false): ?array
     {
-        try {
-            $response = $this->client->get($path);
-        } catch (ClientException $e) {
-            $code = $e->getResponse()->getStatusCode();
+        for ($attempt = 0; $attempt <= self::MAX_RETRIES; $attempt++) {
+            try {
+                $response = $this->client->get($path);
+                return json_decode($response->getBody()->getContents(), true, flags: JSON_THROW_ON_ERROR);
+            } catch (ClientException $e) {
+                $code = $e->getResponse()->getStatusCode();
 
-            if ($code === 404 && $allowNotFound) {
-                return null;
+                if ($code === 404 && $allowNotFound) {
+                    return null;
+                }
+
+                if ($code === 429) {
+                    if ($attempt < self::MAX_RETRIES) {
+                        error_log("Rate limited (429), retry " . ($attempt + 1) . "/" . self::MAX_RETRIES);
+                        sleep(self::SLEEP_ON_429_S);
+                        continue;
+                    }
+                    throw new RuntimeException("Rate limited (429) after " . self::MAX_RETRIES . " retries", 429, $e);
+                }
+
+                throw new RuntimeException(
+                    "HTTP {$code} from zKillboard: " . $e->getResponse()->getBody(),
+                    $code,
+                    $e,
+                );
+            } catch (GuzzleException $e) {
+                throw new RuntimeException("Request failed: {$e->getMessage()}", 0, $e);
             }
-
-            if ($code === 429) {
-                sleep(self::SLEEP_ON_429_S);
-                return $this->request($path, $allowNotFound);
-            }
-
-            throw new RuntimeException(
-                "HTTP {$code} from zKillboard: " . $e->getResponse()->getBody(),
-                $code,
-                $e,
-            );
-        } catch (GuzzleException $e) {
-            throw new RuntimeException("Request failed: {$e->getMessage()}", 0, $e);
         }
 
-        return json_decode($response->getBody()->getContents(), true, flags: JSON_THROW_ON_ERROR);
+        throw new RuntimeException('Unreachable');
     }
 
     private function saveState(): void
     {
         if ($this->stateFile) {
-            file_put_contents($this->stateFile, (string) $this->lastSequenceId);
+            $dir = dirname($this->stateFile);
+            $tmpFile = tempnam($dir, 'state_');
+            file_put_contents($tmpFile, (string) $this->lastSequenceId, LOCK_EX);
+            rename($tmpFile, $this->stateFile);
         }
     }
 }

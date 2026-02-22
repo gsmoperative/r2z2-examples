@@ -1,6 +1,6 @@
 # R2Z2 PHP Example
 
-Example PHP client for the zKillboard R2Z2 ephemeral API. Polls killmails, stores them in MySQL, and supports a 2-level filter pipeline.
+PHP client for the zKillboard R2Z2 ephemeral API. Slim 4 API server + standalone poller, MySQL storage, and 2-level filter pipeline.
 
 ## Setup
 
@@ -10,13 +10,38 @@ mysql -u root -e "CREATE DATABASE IF NOT EXISTS zkillboard"
 mysql -u root zkillboard < schema.sql
 ```
 
-## Usage
+## Run
 
 ```bash
+# API server
+php -S localhost:8080 server.php
+
+# Poller (separate process)
 php example.php
 ```
 
-Edit `example.php` to configure DB credentials (or set `DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME` env vars) and filters.
+The API server runs on PHP's built-in server. The poller runs as a separate process, continuously fetching killmails from R2Z2. Both connect to the same database.
+
+## API
+
+- `GET /health` - database health check
+- `GET /kills` - list kills (`limit`, `offset`, `min_value`, `max_value`, `solar_system_id`, `ship_type_id`, `character_id`, `corporation_id`, `alliance_id`, `npc`, `solo`, `awox`)
+- `GET /kills/{id}` - full killmail with attackers and nested items
+- `GET /stats` - aggregate stats
+
+## Config
+
+All via environment variables:
+
+| Var | Default |
+|-----|---------|
+| `DB_HOST` | 127.0.0.1 |
+| `DB_PORT` | 3306 |
+| `DB_NAME` | zkillboard |
+| `DB_USER` | root |
+| `DB_PASS` | |
+
+Poller filters are configured directly in `example.php`.
 
 ## Filters
 

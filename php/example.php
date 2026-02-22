@@ -16,11 +16,16 @@ $dbName = getenv('DB_NAME') ?: 'zkillboard';
 $dbUser = getenv('DB_USER') ?: 'root';
 $dbPass = getenv('DB_PASS') ?: '';
 
-$pdo = new PDO(
-    "mysql:host={$dbHost};port={$dbPort};dbname={$dbName};charset=utf8mb4",
-    $dbUser,
-    $dbPass,
-);
+try {
+    $pdo = new PDO(
+        "mysql:host={$dbHost};port={$dbPort};dbname={$dbName};charset=utf8mb4",
+        $dbUser,
+        $dbPass,
+    );
+} catch (PDOException $e) {
+    fwrite(STDERR, "Database connection failed: {$e->getMessage()}\n");
+    exit(1);
+}
 
 $repo = new KillmailRepository($pdo);
 
@@ -38,11 +43,15 @@ $zkill = new ZKillboardR2Z2(
 echo "Starting zKillboard poller (filtered: no NPC, nullsec/lowsec only, 10M+ ISK)...\n";
 
 $zkill->poll(function (array $killmail, int $sequenceId) use ($repo) {
-    $killId = $killmail['killmail_id'];
-    $value  = number_format($killmail['zkb']['totalValue'] ?? 0);
+    try {
+        $killId = $killmail['killmail_id'];
+        $value  = number_format($killmail['zkb']['totalValue'] ?? 0);
 
-    $saved = $repo->save($killmail);
-    $status = $saved ? 'saved' : 'skipped (duplicate)';
+        $saved = $repo->save($killmail);
+        $status = $saved ? 'saved' : 'skipped (duplicate)';
 
-    echo "[#{$sequenceId}] Kill {$killId} | {$value} ISK | {$status}\n";
+        echo "[#{$sequenceId}] Kill {$killId} | {$value} ISK | {$status}\n";
+    } catch (Throwable $e) {
+        fwrite(STDERR, "Error saving killmail at sequence {$sequenceId}: {$e->getMessage()}\n");
+    }
 });

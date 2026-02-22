@@ -12,21 +12,62 @@ import type { KillListQuery, R2Z2Killmail } from "./types.js";
 const app = new Hono();
 const repo = new KillmailRepository(pool);
 
+function parseIntParam(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const n = parseInt(value, 10);
+  if (isNaN(n)) return undefined;
+  return n;
+}
+
+function parsePositiveInt(value: string | undefined): number | undefined {
+  const n = parseIntParam(value);
+  if (n !== undefined && n < 1) return undefined;
+  return n;
+}
+
+function parseFloatParam(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const n = parseFloat(value);
+  if (isNaN(n)) return undefined;
+  return n;
+}
+
 // ── Routes ──────────────────────────────────────────────────────────
+
+app.get("/health", async (c) => {
+  try {
+    const conn = await pool.getConnection();
+    await conn.query("SELECT 1");
+    conn.release();
+    return c.json({ status: "ok" });
+  } catch {
+    return c.json({ status: "error", detail: "Database unavailable" }, 503);
+  }
+});
 
 app.get("/kills", async (c) => {
   const q = c.req.query();
 
+  const limit = parseIntParam(q.limit);
+  const offset = parseIntParam(q.offset);
+
+  if (limit !== undefined && (limit < 1 || limit > 1000)) {
+    return c.json({ error: "limit must be between 1 and 1000" }, 400);
+  }
+  if (offset !== undefined && offset < 0) {
+    return c.json({ error: "offset must be >= 0" }, 400);
+  }
+
   const query: KillListQuery = {
-    limit: q.limit ? parseInt(q.limit) : undefined,
-    offset: q.offset ? parseInt(q.offset) : undefined,
-    min_value: q.min_value ? parseFloat(q.min_value) : undefined,
-    max_value: q.max_value ? parseFloat(q.max_value) : undefined,
-    solar_system_id: q.solar_system_id ? parseInt(q.solar_system_id) : undefined,
-    ship_type_id: q.ship_type_id ? parseInt(q.ship_type_id) : undefined,
-    character_id: q.character_id ? parseInt(q.character_id) : undefined,
-    corporation_id: q.corporation_id ? parseInt(q.corporation_id) : undefined,
-    alliance_id: q.alliance_id ? parseInt(q.alliance_id) : undefined,
+    limit,
+    offset,
+    min_value: parseFloatParam(q.min_value),
+    max_value: parseFloatParam(q.max_value),
+    solar_system_id: parsePositiveInt(q.solar_system_id),
+    ship_type_id: parsePositiveInt(q.ship_type_id),
+    character_id: parsePositiveInt(q.character_id),
+    corporation_id: parsePositiveInt(q.corporation_id),
+    alliance_id: parsePositiveInt(q.alliance_id),
     npc: q.npc !== undefined ? q.npc === "true" : undefined,
     solo: q.solo !== undefined ? q.solo === "true" : undefined,
     awox: q.awox !== undefined ? q.awox === "true" : undefined,
@@ -37,9 +78,12 @@ app.get("/kills", async (c) => {
 });
 
 app.get("/kills/:id", async (c) => {
-  const killmailId = parseInt(c.req.param("id"));
-  const kill = await repo.getKill(killmailId);
+  const killmailId = parseInt(c.req.param("id"), 10);
+  if (isNaN(killmailId) || killmailId < 1) {
+    return c.json({ error: "Invalid killmail ID" }, 400);
+  }
 
+  const kill = await repo.getKill(killmailId);
   if (!kill) return c.json({ error: "Killmail not found" }, 404);
   return c.json(kill);
 });
@@ -50,6 +94,8 @@ app.get("/stats", async (c) => {
 });
 
 // ── Poller ──────────────────────────────────────────────────────────
+
+let zkill: ZKillboardR2Z2 | null = null;
 
 if (config.poller.enabled) {
   const pipeline = new FilterPipeline();
@@ -64,7 +110,7 @@ if (config.poller.enabled) {
     pipeline.addLevel2(new MinValueFilter(config.poller.minValue));
   }
 
-  const zkill = new ZKillboardR2Z2(config.poller.stateFile, pipeline);
+  zkill = new ZKillboardR2Z2(config.poller.stateFile, pipeline);
 
   zkill.poll(async (killmail: R2Z2Killmail, sequenceId: number) => {
     try {
@@ -79,6 +125,18 @@ if (config.poller.enabled) {
 
   console.log("Poller started");
 }
+
+// ── Shutdown ────────────────────────────────────────────────────────
+
+function handleShutdown() {
+  console.log("Shutting down...");
+  if (zkill) zkill.stop();
+  pool.end().catch(() => {});
+  process.exit(0);
+}
+
+process.on("SIGTERM", handleShutdown);
+process.on("SIGINT", handleShutdown);
 
 // ── Server ──────────────────────────────────────────────────────────
 
